@@ -1,18 +1,24 @@
 import os
 import asyncio
 import yt_dlp
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- Configuration ---
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # Set this in Railway Variables
-MAX_SIZE_MB = 500
+# Get these from https://my.telegram.org
+API_ID = int(os.getenv("API_ID", "YOUR_API_ID"))
+API_HASH = os.getenv("API_HASH", "YOUR_API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+
+app = Client("video_dl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+MAX_SIZE_GB = 2
 DOWNLOAD_PATH = "downloads"
+user_data = {}
 
 if not os.path.exists(DOWNLOAD_PATH):
     os.makedirs(DOWNLOAD_PATH)
 
-# --- yt-dlp Functions ---
 def get_formats(url):
     ydl_opts = {'quiet': True, 'no_warnings': True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -24,95 +30,79 @@ def get_formats(url):
             for f in formats:
                 filesize = f.get('filesize') or f.get('filesize_approx') or 0
                 height = f.get('height')
-                # Filter: Must be video, under MAX_SIZE, and have a resolution
-                if 0 < filesize <= (MAX_SIZE_MB * 1024 * 1024) and height:
-                    size_str = f"{round(filesize / (1024 * 1024), 1)}MB"
+                # 2GB Limit Check
+                if 0 < filesize <= (MAX_SIZE_GB * 1024 * 1024 * 1024) and height:
+                    size_mb = round(filesize / (1024 * 1024), 1)
                     res_str = f"{height}p"
                     if not any(opt['res'] == res_str for opt in valid_options):
-                        valid_options.append({'res': res_str, 'id': f['format_id'], 'size': size_str})
+                        valid_options.append({'res': res_str, 'id': f['format_id'], 'size': f"{size_mb}MB"})
             
             return sorted(valid_options, key=lambda x: int(x['res'][:-1]), reverse=True), info.get('title')
         except Exception as e:
-            print(f"Error fetching formats: {e}")
+            print(f"Format Error: {e}")
             return [], None
 
-# --- Telegram Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send me a video link to start downloading!")
+@app.on_message(filters.command("start") & filters.private)
+async def start(client, message):
+    await message.reply_text("🚀 **2GB High-Speed Downloader Ready.**\nSend me a link to begin.")
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text
-    if "http" not in url:
-        return
+@app.on_message(filters.text & filters.private)
+async def handle_url(client, message):
+    url = message.text
+    if "http" not in url: return
 
-    msg = await update.message.reply_text("Checking video qualities...")
+    status = await message.reply_text("🔍 Analyzing link...")
     qualities, title = get_formats(url)
 
     if not qualities:
-        await msg.edit_text("❌ No formats found under 500MB or link is unsupported.")
+        await status.edit("❌ No formats found under 2GB.")
         return
 
-    context.user_data['url'] = url
-    context.user_data['title'] = title
-
-    keyboard = [
-        [InlineKeyboardButton(f"{q['res']} ({q['size']})", callback_data=q['id'])] 
-        for q in qualities
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await msg.edit_text(f"🎬 **{title}**\n\nChoose your preferred quality:", reply_markup=reply_markup, parse_mode="Markdown")
-
-async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    user_data[message.from_user.id] = {"url": url, "title": title}
     
-    format_id = query.data
-    url = context.user_data.get('url')
-    title = context.user_data.get('title', 'video')
+    buttons = [[InlineKeyboardButton(f"{q['res']} ({q['size']})", callback_data=q['id'])] for q in qualities]
+    await status.edit(f"🎬 **{title}**\nSelect quality:", reply_markup=InlineKeyboardMarkup(buttons))
+
+@app.on_callback_query()
+async def download_logic(client, callback_query):
+    format_id = callback_query.data
+    uid = callback_query.from_user.id
+    data = user_data.get(uid)
     
-    file_name = f"{DOWNLOAD_PATH}/{query.from_user.id}_{format_id}.mp4"
-    await query.edit_message_text(f"⏳ Downloading {title}... This may take a minute.")
+    if not data:
+        await callback_query.answer("Session expired. Send link again.", show_alert=True)
+        return
+
+    file_path = f"{DOWNLOAD_PATH}/{uid}_{format_id}.mp4"
+    await callback_query.message.edit(f"📥 **Downloading:** {data['title']}\nPlease wait...")
 
     ydl_opts = {
         'format': f'{format_id}+bestaudio/best',
-        'outtmpl': file_name,
+        'outtmpl': file_path,
         'merge_output_format': 'mp4',
-        'quiet': True
+        'quiet': True,
+        'nocheckcertificate': True
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        # Download
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(ydl_opts).download([data['url']]))
 
-        await query.edit_message_text("🚀 Uploading to Telegram...")
+        await callback_query.message.edit("📤 **Uploading to Telegram...** (Up to 2GB)")
         
-        with open(file_name, 'rb') as video:
-            await context.bot.send_video(
-                chat_id=query.message.chat_id,
-                video=video,
-                caption=f"✅ {title}",
-                supports_streaming=True,
-                read_timeout=120,
-                write_timeout=120
-            )
+        # Upload using Pyrogram (Supports 2GB)
+        await client.send_video(
+            chat_id=callback_query.message.chat.id,
+            video=file_path,
+            caption=f"✅ **{data['title']}**",
+            supports_streaming=True
+        )
+        await callback_query.message.delete()
     except Exception as e:
-        await query.edit_message_text(f"❌ Error: {str(e)}")
+        await callback_query.message.edit(f"❌ **Error:** `{str(e)}`")
     finally:
-        # Crucial for Railway: Delete the file after sending to save space
-        if os.path.exists(file_name):
-            os.remove(file_name)
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
-# --- Main Runner ---
-def main():
-    # Increased timeouts for larger files
-    application = Application.builder().token(TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    application.add_handler(CallbackQueryHandler(download_callback))
-
-    print("Bot is running...")
-    application.run_polling()
-
-if __name__ == '__main__':
-    main()
+app.run()
